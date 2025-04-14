@@ -111,7 +111,7 @@ void handle_client(int fd, struct sockaddr_in *addr) {
 
     eprintf("trying to send file: %s\n", target_file_name);
 
-        if ((file_fd = open(target_file_name, O_RDONLY)) < 0) {
+    if ((file_fd = open(target_file_name, O_RDONLY)) < 0) {
         errprint("open(..)");
 
         // TODO: extract into function
