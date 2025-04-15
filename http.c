@@ -29,6 +29,8 @@
 #define MAX(a, b) ((a) < (b) ? (b) : (a))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define HEADER_MAX 1024
+#define PATH_MAX 128
 #define HTTP_SEP "\r\n"
 
 int write_all(int fd, char *buf, size_t len) {
@@ -45,19 +47,19 @@ int write_all(int fd, char *buf, size_t len) {
     return (int)bytes_written;
 }
 
-void handle_client(int fd, struct sockaddr_in *addr) {
-    (void)addr;
-// we'll read at most 1KiB of data until \r\n\r\n
-//  if it's more thant 1KiB it will just close the fd
-#define DATA_MAX 1024
+typedef struct http_header_s {
+    char *path_buf;
+    size_t path_buf_len;
+} http_header_t;
 
-    char buffer[DATA_MAX];
-    size_t data_len = 0;
+int read_http_header(int fd, http_header_t *header_ptr) {
+    char header[HEADER_MAX];
+    size_t header_len = 0;
 
     while (1) {
         int bytes_read;
-        if ((bytes_read = read(fd, buffer + data_len, DATA_MAX - data_len)) <
-            0) {
+        if ((bytes_read =
+                 read(fd, header + header_len, HEADER_MAX - header_len)) < 0) {
             errprint("read(..)");
             break;
         }
@@ -68,65 +70,90 @@ void handle_client(int fd, struct sockaddr_in *addr) {
             break;
         }
 
-        data_len += bytes_read;
+        header_len += bytes_read;
 
-        if (data_len < 4)
+        if (header_len < 4)
             continue;
 
-        if (strncmp(buffer + data_len - 4, HTTP_SEP HTTP_SEP, 4) == 0) {
+        if (strncmp(header + header_len - 4, HTTP_SEP HTTP_SEP, 4) == 0) {
             break;
         }
     }
 
-    if (data_len < 4 ||
-        strncmp(buffer + data_len - 4, HTTP_SEP HTTP_SEP, 4) != 0) {
-        eprintf("client sent bad request");
+    if (header_len < 4 ||
+        strncmp(header + header_len - 4, HTTP_SEP HTTP_SEP, 4) != 0) {
+        return -1;
+    }
+
+    char format[64];
+    snprintf(format, 64, "GET %%%zus HTTP/1.1" HTTP_SEP,
+             header_ptr->path_buf_len - 1);
+
+    if (sscanf(header, format, header_ptr->path_buf) == EOF) {
+        return -1;
+    }
+
+    header_ptr->path_buf_len = strlen(header_ptr->path_buf);
+
+    return 0;
+}
+
+int send_http_response(int fd, uint16_t status, const char *status_desc,
+                       char *content, size_t content_len) {
+    char response_header[HEADER_MAX];
+    int response_header_len =
+        sprintf(response_header,
+                "HTTP/1.1 %u %s" HTTP_SEP "Content-Length: %zu" HTTP_SEP
+                "Content-Type: application/octet-stream" HTTP_SEP HTTP_SEP,
+                status, status_desc, (content == NULL ? 0 : content_len));
+
+    int err;
+    if ((err = write_all(fd, response_header, response_header_len)) < 0)
+        return err;
+
+    if (content == NULL)
+        return 0;
+
+    if ((err = write_all(fd, content, content_len)) < 0)
+        return err;
+
+    return 0;
+}
+
+void handle_client(int fd, struct sockaddr_in *addr) {
+    (void)addr;
+
+    char path[PATH_MAX];
+
+    http_header_t header = {.path_buf = path, .path_buf_len = PATH_MAX};
+
+    if (read_http_header(fd, &header) < 0) {
+        errprint("read_http_header(fd, ..)");
         return;
     }
 
-    char target[128];
-    if (sscanf(buffer, "GET %126s HTTP/1.1" HTTP_SEP, target) == EOF) {
-        eprintf("client sent bad request");
-        return;
+    // truncate at ? or #
+    for (size_t i = 0; i < header.path_buf_len; i++) {
+        if (path[i] == '?' || path[i] == '#')
+            header.path_buf_len = i;
     }
-
-    size_t target_len = 127;
-    for (size_t i = 0; i < target_len; i++) {
-        if (target[i] == '?' || target[i] == '#')
-            target_len = i;
-    }
-
-    target[target_len] = '\0';
-    target_len++;
 
     int file_fd;
 
-    char *target_file_name = target;
-    size_t target_file_name_len = target_len;
+    size_t leading_slash = 0;
+    while (leading_slash < header.path_buf_len && path[leading_slash] == '/')
+        leading_slash++;
 
-    if (target_len >= 1 && target[0] == '/') {
-        target_file_name++;
-        target_file_name_len--;
-    }
+    char *path_rel = path + leading_slash;
 
-    eprintf("trying to send file: %s\n", target_file_name);
+    eprintf("trying to send file: %s\n", path_rel);
 
-    if ((file_fd = open(target_file_name, O_RDONLY)) < 0) {
+    if ((file_fd = open(path_rel, O_RDONLY)) < 0) {
         errprint("open(..)");
 
-        // TODO: extract into function
-        char *response_header = malloc(1024);
-        int response_header_len =
-            sprintf(response_header, "HTTP/1.1 404 Not Found" HTTP_SEP
-                                     "Content-Length: 0" HTTP_SEP HTTP_SEP);
+        if (send_http_response(fd, 404, "Not Found", NULL, 0) < 0)
+            errprint("send_http_response(fd, ..)");
 
-        if (write_all(fd, response_header, response_header_len) < 0) {
-            errprint("write_all(fd, response_header, response_header_len)");
-            free(response_header);
-            return;
-        }
-
-        free(response_header);
         return;
     }
 
@@ -136,6 +163,7 @@ void handle_client(int fd, struct sockaddr_in *addr) {
         return;
     }
 
+    // careful with polling, mmap can block
     char *response_content =
         mmap(0, file_stat.st_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
 
@@ -144,36 +172,15 @@ void handle_client(int fd, struct sockaddr_in *addr) {
         return;
     }
 
-    char *response_header = malloc(1024);
-    int response_header_len =
-        sprintf(response_header,
-                "HTTP/1.1 200 OK" HTTP_SEP "Content-Length: %zu" HTTP_SEP
-                "Content-Type: application/octet-stream" HTTP_SEP HTTP_SEP,
-                file_stat.st_size);
-
-    if (write_all(fd, response_header, response_header_len) < 0) {
-        errprint("write_all(fd, response_header, response_header_len)");
-        goto fail;
-    }
-
-    free(response_header);
-    response_header = NULL;
-
-    if (write_all(fd, response_content, file_stat.st_size) < 0) {
-        errprint("write_all(fd, response_content, file_stat.st_size)");
-        goto fail;
-    }
-
-fail:
-    if (response_header != NULL) {
-        free(response_header);
-        response_header = NULL;
-    }
+    if (send_http_response(fd, 200, "OK", response_content, file_stat.st_size) <
+        0)
+        errprint("send_http_response(fd, ..)");
 
     if (response_content != NULL) {
         munmap(response_content, file_stat.st_size);
         response_content = NULL;
     }
+
     return;
 }
 
