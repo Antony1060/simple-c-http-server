@@ -35,6 +35,7 @@
 
 #define HEADER_MAX 1024
 #define HTTP_PATH_MAX 128
+#define SEND_BUFFER_MAX 4096
 #define HTTP_SEP "\r\n"
 
 // concat 2 strings with an option to replace the first string's \0 with some sep
@@ -64,18 +65,15 @@ int validate_path(char *path, char *disk_path) {
     if (root_len == 0) {
         char cwd[256];
 
-        printf("initializing root dir\n");
         if (getcwd(cwd, 192) == NULL)
             errquit("validate_path_init: getcwd()");
 
         concat_str(cwd, TARGET_DIR, '/');
 
-        printf("initializing root dir: %s\n", cwd);
-
         if (realpath(cwd, root) == NULL)
             errquit("validate_path_init: realpath(..)");
 
-        printf("initializing root dir: %s\n", root);
+        printf("* root dir: %s\n", root);
 
         root_len = strlen(root);
     }
@@ -87,24 +85,26 @@ int validate_path(char *path, char *disk_path) {
 
     concat_str(target, path, '/');
 
-    printf("lookup path: %s\n", target);
-
     if (realpath(target, target_real) == NULL) {
-        errprint("validate_path: realpath(..)");
+        printf("* - invalid path: realpath(..) failed\n");
         return -1;
     }
 
-    printf("real lookup path: %s\n", target_real);
+    printf("* * lookup path: %s\n", target_real);
 
     size_t target_real_len = strlen(target_real);
 
-    if (target_real_len < root_len)
+    if (target_real_len < root_len) {
+        printf("* - invalid path: length less than root\n");
         return -1;
+    }
 
     // check if target_real starts with root
     for (size_t i = 0; i < root_len; i++)
-        if (target_real[i] != root[i])
+        if (target_real[i] != root[i]) {
+            printf("* - invalid path: path doesn't start with root\n");
             return -1;
+        }
 
     if (disk_path != NULL)
         strcpy(disk_path, target_real);
@@ -177,23 +177,43 @@ int read_http_header(int fd, http_header_t *header_ptr) {
     return 0;
 }
 
-int send_http_response(int fd, uint16_t status, const char *status_desc,
-                       char *content, size_t content_len) {
+int move_fd_data(int fd, int out_fd) {
+    uint8_t buffer[SEND_BUFFER_MAX];
+
+    int br = -1;
+    while (br != 0) {
+        if ((br = read(fd, buffer, SEND_BUFFER_MAX)) < 0)
+            return br;
+
+        int sent = 0;
+        while (sent < br) {
+            int bw;
+            if ((bw = write(out_fd, buffer + sent, br - sent)) < 0)
+                return bw;
+
+            sent += bw;
+        }
+    }
+
+    return 0;
+}
+
+int send_http_response(int fd, uint16_t status, const char *status_desc, int content_fd, size_t content_len) {
     char response_header[HEADER_MAX];
     int response_header_len =
         sprintf(response_header,
                 "HTTP/1.1 %u %s" HTTP_SEP "Content-Length: %zu" HTTP_SEP
                 "Content-Type: application/octet-stream" HTTP_SEP HTTP_SEP,
-                status, status_desc, (content == NULL ? 0 : content_len));
+                status, status_desc, (content_fd == -1 ? 0 : content_len));
 
     int err;
     if ((err = write_all(fd, response_header, response_header_len)) < 0)
         return err;
 
-    if (content == NULL)
+    if (content_fd == -1)
         return 0;
 
-    if ((err = write_all(fd, content, content_len)) < 0)
+    if ((err = move_fd_data(content_fd, fd)) < 0)
         return err;
 
     return 0;
@@ -225,20 +245,18 @@ void handle_client(int fd) {
     char path_disk[HTTP_PATH_MAX];
 
     if (validate_path(path_rel, path_disk) < 0) {
-        errprint("validate_path()");
- 
-        if (send_http_response(fd, 404, "Not Found", NULL, 0) < 0)
+        if (send_http_response(fd, 404, "Not Found", 0, 0) < 0)
             errprint("send_http_response(fd, ..)");
 
         return;
     }
 
-    eprintf("trying to send file: %s\n", path_rel);
+    printf("* * trying to send file: %s\n", path_rel);
 
     if ((file_fd = open(path_disk, O_RDONLY)) < 0) {
         errprint("open(..)");
 
-        if (send_http_response(fd, 404, "Not Found", NULL, 0) < 0)
+        if (send_http_response(fd, 404, "Not Found", -1, 0) < 0)
             errprint("send_http_response(fd, ..)");
 
         return;
@@ -247,27 +265,14 @@ void handle_client(int fd) {
     struct stat file_stat;
     if (fstat(file_fd, &file_stat) < 0) {
         errprint("stat(..)");
+        close(file_fd);
         return;
     }
 
-    // careful with polling, mmap can block
-    char *response_content =
-        mmap(0, file_stat.st_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
-
-    if (response_content == MAP_FAILED) {
-        errprint("mmap(..)");
-        return;
-    }
-
-    if (send_http_response(fd, 200, "OK", response_content, file_stat.st_size) <
-        0)
+    if (send_http_response(fd, 200, "OK", file_fd, file_stat.st_size) < 0)
         errprint("send_http_response(fd, ..)");
 
-    if (response_content != NULL) {
-        munmap(response_content, file_stat.st_size);
-        response_content = NULL;
-    }
-
+    close(file_fd);
     return;
 }
 
@@ -283,8 +288,6 @@ int main() {
         0)
         errquit("setsockopt(sockfd, ..)");
 
-    eprintf("socket created: %d\n", sockfd);
-
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -293,12 +296,10 @@ int main() {
     if (bind(sockfd, &addr, sizeof(addr)) < 0)
         errquit("bind(..)");
 
-    eprintf("bind: %d\n", sockfd);
-
     if (listen(sockfd, 0) < 0)
         errquit("listen(..)");
 
-    eprintf("listen: %d\n", sockfd);
+    printf("! listening on %d: %d\n", PORT, sockfd);
 
     while (1) {
         int client;
