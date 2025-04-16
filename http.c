@@ -57,7 +57,7 @@ size_t concat_str(char* l, char *r, char sep) {
     return l_len + r_len;
 }
 
-int validate_path(char *path) {
+int validate_path(char *path, char *disk_path) {
     static char root[256] = {0};
     static size_t root_len = 0;
 
@@ -87,7 +87,27 @@ int validate_path(char *path) {
 
     concat_str(target, path, '/');
 
-    printf("loopup path: %s\n", target_buf);
+    printf("lookup path: %s\n", target);
+
+    if (realpath(target, target_real) == NULL) {
+        errprint("validate_path: realpath(..)");
+        return -1;
+    }
+
+    printf("real lookup path: %s\n", target_real);
+
+    size_t target_real_len = strlen(target_real);
+
+    if (target_real_len < root_len)
+        return -1;
+
+    // check if target_real starts with root
+    for (size_t i = 0; i < root_len; i++)
+        if (target_real[i] != root[i])
+            return -1;
+
+    if (disk_path != NULL)
+        strcpy(disk_path, target_real);
 
     return 0;
 }
@@ -202,15 +222,20 @@ void handle_client(int fd) {
         leading_slash++;
 
     char *path_rel = path + leading_slash;
+    char path_disk[HTTP_PATH_MAX];
 
-    if (validate_path(path_rel) < 0) {
+    if (validate_path(path_rel, path_disk) < 0) {
         errprint("validate_path()");
+ 
+        if (send_http_response(fd, 404, "Not Found", NULL, 0) < 0)
+            errprint("send_http_response(fd, ..)");
+
         return;
     }
 
     eprintf("trying to send file: %s\n", path_rel);
 
-    if ((file_fd = open(path_rel, O_RDONLY)) < 0) {
+    if ((file_fd = open(path_disk, O_RDONLY)) < 0) {
         errprint("open(..)");
 
         if (send_http_response(fd, 404, "Not Found", NULL, 0) < 0)
@@ -247,7 +272,7 @@ void handle_client(int fd) {
 }
 
 int main() {
-    if (validate_path(".") < 0)
+    if (validate_path(".", NULL) < 0)
         errquit("validate_path");
 
     int sockfd;
