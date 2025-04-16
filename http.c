@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
 
 #define errprint(s)                                                            \
     do {                                                                       \
@@ -29,9 +30,67 @@
 #define MAX(a, b) ((a) < (b) ? (b) : (a))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 
+#define PORT 8080
+#define TARGET_DIR "./target"
+
 #define HEADER_MAX 1024
-#define PATH_MAX 128
+#define HTTP_PATH_MAX 128
 #define HTTP_SEP "\r\n"
+
+// concat 2 strings with an option to replace the first string's \0 with some sep
+//  this is really convenient when concating paths
+//  assumes that the left hand side buffer is big enough to store 2 strings
+size_t concat_str(char* l, char *r, char sep) {
+    size_t l_len = strlen(l);
+
+    if (sep != 0) {
+        l[l_len] = '/';
+        l_len++;
+    }
+
+    size_t r_len = strlen(r);
+    for (size_t i = l_len; i < l_len + r_len; i++) {
+        l[i] = r[i - l_len];
+    }
+
+    l[l_len + r_len] = '\0';
+    return l_len + r_len;
+}
+
+int validate_path(char *path) {
+    static char root[256] = {0};
+    static size_t root_len = 0;
+
+    if (root_len == 0) {
+        char cwd[256];
+
+        printf("initializing root dir\n");
+        if (getcwd(cwd, 192) == NULL)
+            errquit("validate_path_init: getcwd()");
+
+        concat_str(cwd, TARGET_DIR, '/');
+
+        printf("initializing root dir: %s\n", cwd);
+
+        if (realpath(cwd, root) == NULL)
+            errquit("validate_path_init: realpath(..)");
+
+        printf("initializing root dir: %s\n", root);
+
+        root_len = strlen(root);
+    }
+
+    // concat path with root
+    char target[root_len + HTTP_PATH_MAX];
+    char target_real[root_len + HTTP_PATH_MAX];
+    strcpy(target, root);
+
+    concat_str(target, path, '/');
+
+    printf("loopup path: %s\n", target_buf);
+
+    return 0;
+}
 
 int write_all(int fd, char *buf, size_t len) {
     size_t bytes_written = 0;
@@ -120,12 +179,10 @@ int send_http_response(int fd, uint16_t status, const char *status_desc,
     return 0;
 }
 
-void handle_client(int fd, struct sockaddr_in *addr) {
-    (void)addr;
+void handle_client(int fd) {
+    char path[HTTP_PATH_MAX];
 
-    char path[PATH_MAX];
-
-    http_header_t header = {.path_buf = path, .path_buf_len = PATH_MAX};
+    http_header_t header = {.path_buf = path, .path_buf_len = HTTP_PATH_MAX};
 
     if (read_http_header(fd, &header) < 0) {
         errprint("read_http_header(fd, ..)");
@@ -141,10 +198,15 @@ void handle_client(int fd, struct sockaddr_in *addr) {
     int file_fd;
 
     size_t leading_slash = 0;
-    while (leading_slash < header.path_buf_len && path[leading_slash] == '/')
+    while (leading_slash < header.path_buf_len - 1 && path[leading_slash] == '/')
         leading_slash++;
 
     char *path_rel = path + leading_slash;
+
+    if (validate_path(path_rel) < 0) {
+        errprint("validate_path()");
+        return;
+    }
 
     eprintf("trying to send file: %s\n", path_rel);
 
@@ -185,6 +247,9 @@ void handle_client(int fd, struct sockaddr_in *addr) {
 }
 
 int main() {
+    if (validate_path(".") < 0)
+        errquit("validate_path");
+
     int sockfd;
     if ((sockfd = socket(AF_INET, SOCK_STREAM, 6)) < 0)
         errquit("socket(..)");
@@ -198,7 +263,7 @@ int main() {
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(8080);
+    addr.sin_port = htons(PORT);
 
     if (bind(sockfd, &addr, sizeof(addr)) < 0)
         errquit("bind(..)");
@@ -213,13 +278,10 @@ int main() {
     while (1) {
         int client;
 
-        struct sockaddr_in addr;
-        socklen_t addr_len;
-
-        if ((client = accept(sockfd, &addr, &addr_len)) < 0)
+        if ((client = accept(sockfd, NULL, NULL)) < 0)
             errquit("accept(sockfd, ..)");
 
-        handle_client(client, &addr);
+        handle_client(client);
         close(client);
     }
 
